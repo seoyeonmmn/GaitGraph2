@@ -49,3 +49,6 @@ venv.bak/
 
 # Project Specific
 data/*.csv
+
+
+lightning_logs/
