@@ -52,3 +52,4 @@ data/*.csv
 
 
 lightning_logs/
+oracl_env.yaml
