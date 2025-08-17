@@ -56,6 +56,12 @@ class ResGCN(nn.Module):
         zero_init_lastBN(self.modules())
 
     def forward(self, x):
+        if x.dim() == 4:
+            # (N, T, V, 15) -> (N, T, V, 3, 5) 형태로 복원
+            # 15가 3*5가 아닐 경우를 대비해 하드코딩보다 변수 사용을 권장
+            # num_input = 3, num_channel = 5
+            N, T, V, _ = x.shape
+            x = x.view(N, T, V, 3, 5) # __init__에서 num_input, num_channel을 저장했다고 가정
         # (N, T, V, I = 3, 2 * C) => (N, I, C * 2, T, V)
         x = x.permute(0, 3, 4, 1, 2)
 

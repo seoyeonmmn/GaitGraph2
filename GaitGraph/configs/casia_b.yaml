@@ -1,6 +1,7 @@
 trainer:
-  gpus: 1
-  max_epochs: 200
+  accelerator: 'gpu'
+  devices: [0]
+  max_epochs: 500
   log_every_n_steps: 5
   check_val_every_n_epoch: 5
   callbacks:
@@ -18,9 +19,11 @@ model:
   learning_rate: 0.005
   loss_temperature: 0.01
   embedding_layer_size: 128
+  multi_branch: True
   tta: True
 data:
-  data_path: "../data"
-  batch_size: 768
+  data_path: "/data/casiab"
+  # batch_size: 768
+  batch_size: 1152
   num_workers: 8
   sequence_length: 60

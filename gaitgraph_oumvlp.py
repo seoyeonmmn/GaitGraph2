@@ -1,60 +1,48 @@
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.utilities.cli import LightningCLI
-from pytorch_lightning.utilities.cloud_io import load as pl_load
+from pytorch_lightning.cli import LightningCLI
 from pytorch_metric_learning import losses, distances
 from torch.utils.data import DataLoader
 from torch_geometric.data import Data
 from torchvision.transforms import Compose
 
 from GaitGraph import cli_logo
-from GaitGraph.datasets.casia_b_pose import CASIABPose
 from GaitGraph.datasets.graph import Graph
-from GaitGraph.models import ResGCN
+from GaitGraph.datasets.oumvlp_pose import OUMVLPPose
+from GaitGraph.models import ResGCN, StGCN
 from GaitGraph.transforms import ToFlatTensor
-from GaitGraph.transforms.augmentation import RandomSelectSequence, PadSequence, SelectSequenceCenter, \
-    PointNoise, RandomFlipLeftRight, RandomMove, RandomFlipSequence, JointNoise, RandomCropSequence, \
-    ShuffleSequence
+from GaitGraph.transforms.augmentation import RandomSelectSequence, PadSequence, SelectSequenceCenter, NormalizeEmpty, \
+    RandomFlipLeftRight, PointNoise, RandomFlipSequence, JointNoise, RandomMove, ShuffleSequence
 from GaitGraph.transforms.multi_input import MultiInput
 
 
-class GaitGraphCASIAB(pl.LightningModule):
+class GaitGraphOUMVLP(pl.LightningModule):
     def __init__(
             self,
-            learning_rate: float = 0.005,
-            weight_decay: float = 1e-5,
+            learning_rate: float = 0.01,
             lr_div_factor: float = 25.,
             loss_temperature: float = 0.07,
-            embedding_layer_size: int = 128,
+            embedding_layer_size: int = 64,
             multi_input: bool = True,
-            multi_branch: bool = False,
-            backend_name="resgcn-n39-r8",
-            load_from_checkpoint: str = None,
-            tta: bool = True,
+            backend_name="resgcn-n51-r4",
+            tta: bool = True
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.graph = Graph("coco")
+        self.graph = Graph("oumvlp")
         model_args = {
             "A": torch.tensor(self.graph.A, dtype=torch.float32, requires_grad=False),
             "num_class": embedding_layer_size,
-            "num_input": 3 if multi_branch else 1,
+            "num_input": 3 if multi_input else 1,
             "num_channel": 5 if multi_input else 3,
             "parts": self.graph.parts,
         }
-        if multi_input and not multi_branch:
-            model_args["num_channel"] = 15
-
-        self.backbone = ResGCN(backend_name, **model_args)
-
-        if load_from_checkpoint:
-            checkpoint = pl_load(load_from_checkpoint)
-            if "model" in checkpoint:
-                self.load_state_dict({f"backbone.{k}": v for k, v in checkpoint["model"].items()})
-            else:
-                self.load_state_dict(checkpoint["state_dict"])
+        if backend_name == "st-gcn":
+            self.backbone = StGCN(3, self.graph, embedding_layer_size=embedding_layer_size)
+        else:
+            self.backbone = ResGCN(backend_name, **model_args)
 
         self.distance = distances.LpDistance()
         self.train_loss = losses.SupConLoss(loss_temperature, distance=self.distance)
@@ -65,7 +53,6 @@ class GaitGraphCASIAB(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y, _ = batch
-
         y_hat = self(x)
 
         loss = self.train_loss(y_hat, y.squeeze())
@@ -79,19 +66,14 @@ class GaitGraphCASIAB(pl.LightningModule):
         loss = self.val_loss(y_hat, y.squeeze())
         self.log("val_loss", loss, on_step=True)
 
-        return self.test_step(batch, batch_idx)
-
-    def validation_epoch_end(self, outputs):
-        return self.test_epoch_end(outputs, print_output=False)
-
     def predict_step(self, batch, batch_idx: int, dataloader_idx=None):
-        x, y, (angle, seq_num, walking_status) = batch
+        x, y, (angle, seq_num, _) = batch
         feature = self.backbone(x)[1]
 
-        return feature, x, y, angle, seq_num, walking_status
+        return feature, x, y, angle, seq_num
 
     def test_step(self, batch, batch_idx):
-        x, y, (angle, seq_num, walking_status) = batch
+        x, y, (angle, seq_num, _) = batch
         bsz = x.shape[0]
 
         if self.hparams.tta:
@@ -111,75 +93,69 @@ class GaitGraphCASIAB(pl.LightningModule):
             f1, f2, f3 = torch.split(y_hat, [bsz, bsz, bsz], dim=0)
             y_hat = torch.cat((f1, f2, f3), dim=1)
 
-        return y_hat, y, angle, seq_num, walking_status
+        return y_hat, y, angle, seq_num
 
     def test_epoch_end(self, outputs, print_output=True):
         embeddings = dict()
         for batch in outputs:
-            y_hat, subject_id, angle, seq_num, walking_status = batch
+            y_hat, subject_id, angle, seq_num = batch
             embeddings.update({
-                (subject_id[i].item(), walking_status[i].item(), seq_num[i].item(), angle[i].item()): y_hat[i]
+                (subject_id[i].item(), angle[i].item(), seq_num[i].item()): y_hat[i]
                 for i in range(y_hat.shape[0])
             })
 
-        gallery = {k: v for (k, v) in embeddings.items() if k[1] == 0 and k[2] <= 4}
+        angles = list(range(0, 91, 15)) + list(range(180, 271, 15))
+        num_angles = len(angles)
+        gallery = {k: v for (k, v) in embeddings.items() if k[2] == 0}
+
         gallery_per_angle = {}
-        for angle in range(0, 181, 18):
-            gallery_per_angle[angle] = {k: v for (k, v) in gallery.items() if k[3] == angle}
+        for angle in angles:
+            gallery_per_angle[angle] = {k: v for (k, v) in gallery.items() if k[1] == angle}
 
-        probe_nm = {k: v for (k, v) in embeddings.items() if k[1] == 0 and k[2] >= 5}
-        probe_bg = {k: v for (k, v) in embeddings.items() if k[1] == 1}
-        probe_cl = {k: v for (k, v) in embeddings.items() if k[1] == 2}
+        probe = {k: v for (k, v) in embeddings.items() if k[2] == 1}
 
-        correct = torch.zeros((3, 11, 11))
-        total = torch.zeros((3, 11, 11))
-        for gallery_angle in range(0, 181, 18):
-            gallery_embeddings = torch.stack(list(gallery_per_angle[gallery_angle].values()))
+        accuracy = torch.zeros((num_angles + 1, num_angles + 1))
+        correct = torch.zeros_like(accuracy)
+        total = torch.zeros_like(accuracy)
+
+        for gallery_angle in angles:
+            gallery_embeddings = torch.stack(list(gallery_per_angle[gallery_angle].values()), 0)
             gallery_targets = list(gallery_per_angle[gallery_angle].keys())
-            gallery_pos = int(gallery_angle / 18)
+            gallery_pos = angles.index(gallery_angle)
 
-            probe_num = 0
-            for probe in [probe_nm, probe_bg, probe_cl]:
-                probe_embeddings = torch.stack(list(probe.values()))
-                q_g_dist = self.distance(probe_embeddings, gallery_embeddings)
+            probe_embeddings = torch.stack(list(probe.values()))
+            q_g_dist = self.distance(probe_embeddings, gallery_embeddings)
 
-                for idx, target in enumerate(probe.keys()):
-                    subject_id, _, _, probe_angle = target
-                    probe_pos = int(probe_angle / 18)
+            for idx, target in enumerate(probe.keys()):
+                subject_id, probe_angle, _ = target
+                probe_pos = angles.index(probe_angle)
 
-                    min_pos = torch.argmin(q_g_dist[idx])
-                    min_target = gallery_targets[int(min_pos)]
+                min_pos = torch.argmin(q_g_dist[idx])
+                min_target = gallery_targets[int(min_pos)]
 
-                    if min_target[0] == subject_id:
-                        correct[probe_num, gallery_pos, probe_pos] += 1
-                    total[probe_num, gallery_pos, probe_pos] += 1
+                if min_target[0] == subject_id:
+                    correct[gallery_pos, probe_pos] += 1
+                total[gallery_pos, probe_pos] += 1
 
-                probe_num += 1
+        accuracy[:-1, :-1] = correct[:-1, :-1] / total[:-1, :-1]
 
-        accuracy = correct / total
+        accuracy[:-1, -1] = torch.mean(accuracy[:-1, :-1], dim=1)
+        accuracy[-1, :-1] = torch.mean(accuracy[:-1, :-1], dim=0)
 
-        accuracy_avg = torch.mean(accuracy)
+        accuracy_avg = torch.mean(accuracy[:-1, :-1])
+        accuracy[-1, -1] = accuracy_avg
         self.log("test/accuracy", accuracy_avg)
 
-        # Exclude same view
-        for i in range(3):
-            accuracy[i] -= torch.diag(torch.diag(accuracy[i]))
-
-        accuracy_flat = torch.sum(accuracy, 1) / 10
-
-        header = ["NM#5-6", "BG#1-2", "CL#1-2"]
-
-        sub_accuracies_avg = torch.mean(accuracy_flat, dim=1)
-        sub_accuracies = dict(zip(header, list(sub_accuracies_avg)))
-        for name, value in sub_accuracies.items():
-            self.log(f"test/acc_{name}", value)
+        for angle, avg in zip(angles, accuracy[:-1, -1].tolist()):
+            self.log(f"test/probe_{angle}", avg)
+        for angle, avg in zip(angles, accuracy[-1, :-1].tolist()):
+            self.log(f"test/gallery_{angle}", avg)
 
         df = pd.DataFrame(
-            torch.cat([accuracy_flat, sub_accuracies_avg.unsqueeze(1)], dim=1).numpy(),
-            header,
-            list(range(0, 181, 18)) + ["mean"],
+            accuracy.numpy(),
+            angles + ["mean"],
+            angles + ["mean"],
         )
-
         df = (df * 100).round(1)
 
         if print_output:
@@ -190,10 +166,9 @@ class GaitGraphCASIAB(pl.LightningModule):
         return df
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
+        optimizer = torch.optim.Adam(
             self.parameters(),
-            lr=self.hparams.learning_rate,
-            weight_decay=self.hparams.weight_decay
+            lr=self.hparams.learning_rate
         )
         lr_schedule = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -208,15 +183,16 @@ class GaitGraphCASIAB(pl.LightningModule):
         return [optimizer], [lr_dict]
 
 
-class CASIABPoseModule(pl.LightningDataModule):
+class OUMVLPPoseModule(pl.LightningDataModule):
     def __init__(
             self,
             data_path: str,
-            batch_size: int = 256,
+            dataset_path: str,
+            keypoints: str = "openpose",
+            batch_size: int = 512,
             num_workers: int = 4,
-            sequence_length: int = 60,
+            sequence_length: int = 30,
             multi_input: bool = True,
-            multi_branch: bool = False,
             flip_sequence_p: float = 0.5,
             flip_lr_p: float = 0.5,
             joint_noise: float = 0.1,
@@ -227,7 +203,7 @@ class CASIABPoseModule(pl.LightningDataModule):
             confidence_noise: float = 0.,
     ):
         super().__init__()
-        self.graph = Graph("coco")
+        self.graph = Graph("oumvlp")
 
         transform_train = Compose([
             PadSequence(sequence_length),
@@ -238,10 +214,11 @@ class CASIABPoseModule(pl.LightningDataModule):
             JointNoise(joint_noise),
             PointNoise(point_noise),
             RandomMove(random_move),
-            MultiInput(self.graph.connect_joint, self.graph.center, enabled=multi_input, concat=not multi_branch),
+            MultiInput(self.graph.connect_joint, self.graph.center, enabled=multi_input),
             ToFlatTensor()
         ])
         transform_val = Compose([
+            NormalizeEmpty(),
             PadSequence(sequence_length),
             SelectSequenceCenter(sequence_length),
             ShuffleSequence(test_shuffle_sequence),
@@ -249,9 +226,9 @@ class CASIABPoseModule(pl.LightningDataModule):
             ToFlatTensor()
         ])
 
-        self.dataset_train = CASIABPose(data_path, "train", transform=transform_train)
-        self.dataset_val = CASIABPose(data_path, "test", transform=transform_val)
-        self.dataset_test = CASIABPose(data_path, "test", transform=transform_val)
+        self.dataset_train = OUMVLPPose(data_path, dataset_path, keypoints, "train", transform=transform_train)
+        self.dataset_val = OUMVLPPose(data_path, dataset_path, keypoints, "test", transform=transform_val)
+        self.dataset_test = OUMVLPPose(data_path, dataset_path, keypoints, "test", transform=transform_val)
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -271,10 +248,11 @@ class CASIABPoseModule(pl.LightningDataModule):
 
 def cli_main():
     LightningCLI(
-        GaitGraphCASIAB,
-        CASIABPoseModule,
+        GaitGraphOUMVLP,
+        OUMVLPPoseModule,
         seed_everything_default=5318008,
-        save_config_overwrite=True
+        # save_config_overwrite=True,
+        run=True
     )
 
 

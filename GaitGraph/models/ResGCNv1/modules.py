@@ -41,8 +41,10 @@ class ResGCN_Module(nn.Module):
                 nn.BatchNorm2d(out_channels),
             )
 
-        spatial_block = import_class('models.ResGCNv1.blocks.Spatial_{}_Block'.format(block))
-        temporal_block = import_class('models.ResGCNv1.blocks.Temporal_{}_Block'.format(block))
+        # spatial_block = import_class('models.ResGCNv1.blocks.Spatial_{}_Block'.format(block))
+        # temporal_block = import_class('models.ResGCNv1.blocks.Temporal_{}_Block'.format(block))
+        spatial_block = import_class('GaitGraph.models.ResGCNv1.blocks.Spatial_{}_Block'.format(block))
+        temporal_block = import_class('GaitGraph.models.ResGCNv1.blocks.Temporal_{}_Block'.format(block))
         self.scn = spatial_block(in_channels, out_channels, max_graph_distance, block_res, **kwargs)
         self.tcn = temporal_block(out_channels, temporal_window_size, stride, block_res, **kwargs)
         self.edge = nn.Parameter(torch.ones_like(A))

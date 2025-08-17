@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from models.st_gcn.tgcn import ConvTemporalGraphical
-
+# from models.st_gcn.tgcn import ConvTemporalGraphical
+from .tgcn import ConvTemporalGraphical
 
 class STGCNEmbedding(nn.Module):
     r"""Spatial temporal graph convolutional networks.
